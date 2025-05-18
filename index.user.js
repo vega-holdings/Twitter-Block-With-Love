@@ -129,6 +129,19 @@
 
   const queryIds = {}
 
+  function extractFeat (url) {
+    try {
+      const query = url.split('?')[1]
+      const params = new URLSearchParams(query)
+      const parts = []
+      if (params.has('features')) parts.push('features=' + params.get('features'))
+      if (params.has('fieldToggles')) parts.push('fieldToggles=' + params.get('fieldToggles'))
+      return parts.join('&')
+    } catch (e) {
+      return ''
+    }
+  }
+
   ;(function hookFetch () {
     const origFetch = window.fetch
     window.fetch = function (...args) {
@@ -136,13 +149,13 @@
       const url = request instanceof Request ? request.url : request
       let m
       if ((m = /\/i\/api\/graphql\/([^/]+)\/Followers/.exec(url))) {
-        queryIds.followers = m[1]
+        queryIds.followers = { id: m[1], feat: extractFeat(url) }
       } else if ((m = /\/i\/api\/graphql\/([^/]+)\/UserByScreenName/.exec(url))) {
-        queryIds.userByScreenName = m[1]
+        queryIds.userByScreenName = { id: m[1], feat: extractFeat(url) }
       } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Favoriters/.exec(url))) {
-        queryIds.favoriters = m[1]
+        queryIds.favoriters = { id: m[1], feat: extractFeat(url) }
       } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Retweeters/.exec(url))) {
-        queryIds.retweeters = m[1]
+        queryIds.retweeters = { id: m[1], feat: extractFeat(url) }
       }
       return origFetch.apply(this, args)
     }
@@ -420,16 +433,38 @@
     return location.href.split('lists/')[1].split('/')[0]
   }
 
-  const paramsREQ = `features=%7B%22responsive_web_graphql_exclude_directive_enabled%22%3Atrue%2C%22verified_phone_label_enabled%22%3Afalse%2C%22creator_subscriptions_tweet_preview_api_enabled%22%3Atrue%2C%22responsive_web_graphql_timeline_navigation_enabled%22%3Atrue%2C%22responsive_web_graphql_skip_user_profile_image_extensions_enabled%22%3Afalse%2C%22c9s_tweet_anatomy_moderator_badge_enabled%22%3Atrue%2C%22tweetypie_unmention_optimization_enabled%22%3Atrue%2C%22responsive_web_edit_tweet_api_enabled%22%3Atrue%2C%22graphql_is_translatable_rweb_tweet_is_translatable_enabled%22%3Atrue%2C%22view_counts_everywhere_api_enabled%22%3Atrue%2C%22longform_notetweets_consumption_enabled%22%3Atrue%2C%22responsive_web_twitter_article_tweet_consumption_enabled%22%3Atrue%2C%22tweet_awards_web_tipping_enabled%22%3Afalse%2C%22freedom_of_speech_not_reach_fetch_enabled%22%3Atrue%2C%22standardized_nudges_misinfo%22%3Atrue%2C%22tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled%22%3Atrue%2C%22rweb_video_timestamps_enabled%22%3Atrue%2C%22longform_notetweets_rich_text_read_enabled%22%3Atrue%2C%22longform_notetweets_inline_media_enabled%22%3Atrue%2C%22responsive_web_enhance_cards_enabled%22%3Afalse%7D`
-
   // fetch current followers
 
+  async function fetch_followers (userName, count) {
+    const { id: userIdQuery, feat: userFeat } = await wait_for_query_id('userByScreenName')
+    const userRes = await ajax.get(`https://x.com/i/api/graphql/${userIdQuery}/UserByScreenName?variables=%7B%22screen_name%22%3A%22${userName}%22%7D&${userFeat}`)
+    const userId = userRes.data["data"]["user"]["result"]["rest_id"]
+
+    const { id, feat } = await wait_for_query_id('followers')
+    const response = await ajax.get(`https://x.com/i/api/graphql/${id}/Followers?variables=%7B%22userId%22%3A%22${userId}%22%2C%22count%22%3A${count}%2C%22includePromotedContent%22%3Afalse%7D&${feat}`)
+    const data = response.data
+
+    const users = data["data"]["user"]["result"]["timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
+      if (instruction.type === 'TimelineAddEntries') {
+        instruction.entries.forEach(entry => {
+          if (entry.content && entry.content.entryType === 'TimelineTimelineItem' && entry.content.itemContent && entry.content.itemContent.itemType === 'TimelineUser') {
+            if (entry.content.itemContent.user_results && entry.content.itemContent.user_results.result && typeof entry.content.itemContent.user_results.result.rest_id !== 'undefined') {
+              const restId = entry.content.itemContent.user_results.result.rest_id
+              acc[restId] = true
+            }
+          }
+        })
+      }
+      return acc
+    }, {})
+
+    return Object.keys(users)
   }
 
   // fetch_likers and fetch_no_comment_reposters need to be merged into one function
   async function fetch_likers (tweetId) {
-    const favoritersId = await wait_for_query_id('favoriters')
-    const response = await ajax.get(`https://x.com/i/api/graphql/${favoritersId}/Favoriters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${paramsREQ}`);
+    const { id, feat } = await wait_for_query_id('favoriters')
+    const response = await ajax.get(`https://x.com/i/api/graphql/${id}/Favoriters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${feat}`);
         const data = response.data;
 
         const users = data["data"]["favoriters_timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
@@ -451,8 +486,8 @@
   }
 
   async function fetch_no_comment_reposters (tweetId) {
-    const retweetersId = await wait_for_query_id('retweeters')
-    const response = await ajax.get(`https://x.com/i/api/graphql/${retweetersId}/Retweeters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${paramsREQ}`);
+    const { id, feat } = await wait_for_query_id('retweeters')
+    const response = await ajax.get(`https://x.com/i/api/graphql/${id}/Retweeters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${feat}`);
         const data = response.data;
 
         const users = data["data"]["retweeters_timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
