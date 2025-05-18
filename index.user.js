@@ -421,6 +421,19 @@
     return ''
   }
 
+  const PUBLIC_BEARER_TOKEN =
+    'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA'
+
+  function get_bearer_token () {
+    for (const script of document.querySelectorAll('script')) {
+      const m = script.textContent.match(/Bearer\s+([A-Za-z0-9%-]+)/)
+      if (m) {
+        return m[1]
+      }
+    }
+    return get_cookie('ct0') || PUBLIC_BEARER_TOKEN
+  }
+
   function get_ancestor (dom, level) {
     for (let i = 0; i < level; ++i) {
       dom = dom.parent()
@@ -432,7 +445,7 @@
     baseURL: 'https://api.x.com',
     withCredentials: true,
     headers: {
-      Authorization: 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
+      Authorization: `Bearer ${get_bearer_token()}`,
       'X-Twitter-Auth-Type': 'OAuth2Session',
       'X-Twitter-Active-User': 'yes',
       'X-Csrf-Token': get_cookie('ct0')
