@@ -854,34 +854,59 @@
   }
 
   function main () {
-    const sleepTime = 700 // ms
-
     insert_css()
     const TBWLPanel = compose_panel()
 
-    let prevURL = undefined
-    setInterval(_ => {
-      const currentURL = window.location.href
-      if (prevURL !== currentURL) {
-        prevURL = currentURL
+    let prevURL
 
-        // Attention: /retweets may change to /reposts at any time.
-        // Good job, Elon.
-        // ♪ CEO, entrepreneur, born in 1971, Elon~~ Elon Reeve Musk~~ ♪♪
-        if (currentURL.endsWith('/likes') || currentURL.endsWith('/retweets') || currentURL.endsWith('/followers')) {
-          if ($('#tbwl-panel').length) {
-            TBWLPanel.slideDown('fast')
-          } else {
-            waitForKeyElements('div[data-testid="primaryColumn"] section, div[data-testid="primaryColumn"] div[data-testid="emptyState"]', ele => {
-              TBWLPanel.insertBefore(ele)
-              TBWLPanel.slideDown()
-            }, true)
-          }
+    function handleURLChange () {
+      const currentURL = window.location.href
+      if (prevURL === currentURL) return
+      prevURL = currentURL
+
+      // Attention: /retweets may change to /reposts at any time.
+      // Good job, Elon.
+      // ♪ CEO, entrepreneur, born in 1971, Elon~~ Elon Reeve Musk~~ ♪♪
+      if (currentURL.endsWith('/likes') || currentURL.endsWith('/retweets') || currentURL.endsWith('/followers')) {
+        if ($('#tbwl-panel').length) {
+          TBWLPanel.slideDown('fast')
         } else {
-          TBWLPanel.slideUp('fast')
+          waitForKeyElements('div[data-testid="primaryColumn"] section, div[data-testid="primaryColumn"] div[data-testid="emptyState"]', ele => {
+            TBWLPanel.insertBefore(ele)
+            TBWLPanel.slideDown()
+          }, true)
         }
+      } else {
+        TBWLPanel.slideUp('fast')
       }
-    }, sleepTime)
+    }
+
+    function hookNavigation () {
+      const origPushState = history.pushState
+      const origReplaceState = history.replaceState
+
+      history.pushState = function (...args) {
+        const ret = origPushState.apply(this, args)
+        handleURLChange()
+        return ret
+      }
+
+      history.replaceState = function (...args) {
+        const ret = origReplaceState.apply(this, args)
+        handleURLChange()
+        return ret
+      }
+
+      window.addEventListener('popstate', handleURLChange)
+
+      new MutationObserver(handleURLChange).observe(document.body, {
+        childList: true,
+        subtree: true
+      })
+    }
+
+    hookNavigation()
+    handleURLChange()
 
     // TODO: merge into the above way
     // need a way to hide the include_original_tweeter option
