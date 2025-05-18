@@ -129,53 +129,54 @@
 
   const queryIds = {}
 
-  function p_limit (concurrency) {
-    const queue = []
-    let activeCount = 0
+/* ---------- feature extractor ---------- */
+function extractFeat(url) {
+  try {
+    const qs = url.split('?')[1] || '';
+    const params = new URLSearchParams(qs);
+    const out = [];
+    if (params.has('features'))      out.push('features='      + params.get('features'));
+    if (params.has('fieldToggles'))  out.push('fieldToggles='  + params.get('fieldToggles'));
+    return out.join('&');
+  } catch { return ''; }
+}
 
-    const next = () => {
-      if (activeCount >= concurrency || queue.length === 0) return
-      const { fn, resolve, reject } = queue.shift()
-      activeCount++
-      Promise.resolve()
-        .then(fn)
-        .then(value => {
-          activeCount--
-          resolve(value)
-          next()
-        }, err => {
-          activeCount--
-          reject(err)
-          next()
-        })
+/* ---------- tiny promise-pool (rate-limit) ---------- */
+function p_limit(concurrency) {
+  const queue = [];
+  let active = 0;
+  const next = () => {
+    if (active >= concurrency || !queue.length) return;
+    const { fn, res, rej } = queue.shift();
+    active++;
+    Promise.resolve()
+      .then(fn)
+      .then(v => { active--; res(v); next(); },
+            e => { active--; rej(e); next(); });
+  };
+  return fn => new Promise((res, rej) => { queue.push({ fn, res, rej }); next(); });
+}
+const requestLimit = p_limit(2);      // two parallel X calls max
+
+(function hookFetch () {
+  const origFetch = window.fetch;
+  window.fetch = function (...args) {
+    const req = args[0];
+    const url = req instanceof Request ? req.url : req;
+    let m;
+    if ((m = /\/i\/api\/graphql\/([^/]+)\/Followers/.exec(url))) {
+      queryIds.followers        = { id: m[1], feat: extractFeat(url) };
+    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/UserByScreenName/.exec(url))) {
+      queryIds.userByScreenName = { id: m[1], feat: extractFeat(url) };
+    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Favoriters/.exec(url))) {
+      queryIds.favoriters       = { id: m[1], feat: extractFeat(url) };
+    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Retweeters/.exec(url))) {
+      queryIds.retweeters       = { id: m[1], feat: extractFeat(url) };
     }
+    return origFetch.apply(this, args);
+  };
+})();
 
-    return (fn) => new Promise((resolve, reject) => {
-      queue.push({ fn, resolve, reject })
-      next()
-    })
-  }
-
-  const requestLimit = p_limit(2)
-
-  ;(function hookFetch () {
-    const origFetch = window.fetch
-    window.fetch = function (...args) {
-      const request = args[0]
-      const url = request instanceof Request ? request.url : request
-      let m
-      if ((m = /\/i\/api\/graphql\/([^/]+)\/Followers/.exec(url))) {
-        queryIds.followers = m[1]
-      } else if ((m = /\/i\/api\/graphql\/([^/]+)\/UserByScreenName/.exec(url))) {
-        queryIds.userByScreenName = m[1]
-      } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Favoriters/.exec(url))) {
-        queryIds.favoriters = m[1]
-      } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Retweeters/.exec(url))) {
-        queryIds.retweeters = m[1]
-      }
-      return origFetch.apply(this, args)
-    }
-  })()
 
   async function scrape_query_id_from_main (key) {
     try {
@@ -513,107 +514,116 @@
     return location.href.split('lists/')[1].split('/')[0]
   }
 
-  const paramsREQ = `features=%7B%22responsive_web_graphql_exclude_directive_enabled%22%3Atrue%2C%22verified_phone_label_enabled%22%3Afalse%2C%22creator_subscriptions_tweet_preview_api_enabled%22%3Atrue%2C%22responsive_web_graphql_timeline_navigation_enabled%22%3Atrue%2C%22responsive_web_graphql_skip_user_profile_image_extensions_enabled%22%3Afalse%2C%22c9s_tweet_anatomy_moderator_badge_enabled%22%3Atrue%2C%22tweetypie_unmention_optimization_enabled%22%3Atrue%2C%22responsive_web_edit_tweet_api_enabled%22%3Atrue%2C%22graphql_is_translatable_rweb_tweet_is_translatable_enabled%22%3Atrue%2C%22view_counts_everywhere_api_enabled%22%3Atrue%2C%22longform_notetweets_consumption_enabled%22%3Atrue%2C%22responsive_web_twitter_article_tweet_consumption_enabled%22%3Atrue%2C%22tweet_awards_web_tipping_enabled%22%3Afalse%2C%22freedom_of_speech_not_reach_fetch_enabled%22%3Atrue%2C%22standardized_nudges_misinfo%22%3Atrue%2C%22tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled%22%3Atrue%2C%22rweb_video_timestamps_enabled%22%3Atrue%2C%22longform_notetweets_rich_text_read_enabled%22%3Atrue%2C%22longform_notetweets_inline_media_enabled%22%3Atrue%2C%22responsive_web_enhance_cards_enabled%22%3Afalse%7D`
-
   // fetch current followers
-  async function fetch_followers (userName, count) {
-    const userByScreenNameId = await wait_for_query_id('userByScreenName')
-    const paramsUserExtReq = 'features=%7B%22hidden_profile_subscriptions_enabled%22%3Atrue%2C%22profile_label_improvements_pcf_label_in_post_enabled%22%3Atrue%2C%22rweb_tipjar_consumption_enabled%22%3Atrue%7D'
-    const userIdResponse = await ajax.get(`https://x.com/i/api/graphql/${userByScreenNameId}/UserByScreenName?variables=%7B%22screen_name%22%3A%22${userName}%22%7D&${paramsUserExtReq}`)
-    const userId = userIdResponse.data["data"]["user"]["result"]["rest_id"]
+// Followers -----------------------------------------------------------------
+async function fetch_followers(userName, max = 1000) {
+  // 1) resolve userId
+  const { id: uId } = await wait_for_query_id('userByScreenName');
+  const uResp = await safeCall(
+    'userByScreenName',
+    buildGqlUrl('userByScreenName', { screen_name: userName })
+  );
+  const userId = uResp.data.data.user.result.rest_id;
 
-    const followersId = await wait_for_query_id('followers')
-    const followers = []
-    let cursor = null
-    while (followers.length < count) {
-      const variablesObj = {
-        userId,
-        count: Math.min(200, count - followers.length),
-        cursor,
-        includePromotedContent: false
+  // 2) walk the Followers timeline
+  const followers = [];
+  let cursor = null;
+
+  do {
+    const batchSize = Math.min(200, max - followers.length);
+    const url = buildGqlUrl('followers', {
+      userId,
+      count: batchSize,
+      cursor,
+      includePromotedContent: false,
+    });
+
+    const resp = await safeCall('followers', url);
+    const instructions =
+      resp.data.data.user.result.timeline.timeline.instructions;
+
+    // extract IDs + bottom cursor
+    cursor = null;
+    instructions.forEach((ins) => {
+      if (ins.type === 'TimelineAddEntries') {
+        ins.entries.forEach((e) => {
+          if (
+            e.content?.entryType === 'TimelineTimelineItem' &&
+            e.content.itemContent?.itemType === 'TimelineUser'
+          ) {
+            const id =
+              e.content.itemContent.user_results?.result?.rest_id;
+            if (id) followers.push(id);
+          }
+          if (
+            e.content?.entryType === 'TimelineTimelineCursor' &&
+            e.content.cursorType === 'Bottom'
+          ) {
+            cursor = e.content.value;
+          }
+        });
       }
-      const variables = encodeURIComponent(JSON.stringify(variablesObj))
-      const response = await ajax.get(`https://x.com/i/api/graphql/${followersId}/Followers?variables=${variables}&${paramsREQ}`)
-      const instructions = response.data["data"]["user"]["result"]["timeline"]["timeline"]["instructions"]
-      cursor = null
-      instructions.forEach(instruction => {
-        if (instruction.type === 'TimelineAddEntries') {
-          instruction.entries.forEach(entry => {
-            if (
-              entry.content &&
-              entry.content.entryType === 'TimelineTimelineItem' &&
-              entry.content.itemContent &&
-              entry.content.itemContent.itemType === 'TimelineUser'
-            ) {
-              const restId = entry.content.itemContent.user_results &&
-                entry.content.itemContent.user_results.result &&
-                entry.content.itemContent.user_results.result.rest_id
-              if (restId) followers.push(restId)
-            } else if (
-              entry.content &&
-              entry.content.entryType === 'TimelineTimelineCursor' &&
-              entry.content.cursorType === 'Bottom'
-            ) {
-              cursor = entry.content.value
-            }
-          })
-        }
-      })
-      if (!cursor) break
-    }
-    return followers.slice(0, count)
-  }
+    });
+  } while (cursor && followers.length < max);
 
-  // fetch_likers and fetch_no_comment_reposters need to be merged into one function
-  async function fetch_likers (tweetId) {
-    const favoritersId = await wait_for_query_id('favoriters')
-    const response = await safeCall('favoriters', `https://x.com/i/api/graphql/${favoritersId}/Favoriters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${paramsREQ}`)
-        const data = response.data;
+  return followers.slice(0, max);
+}
 
-        const users = data["data"]["favoriters_timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
-        if (instruction.type === 'TimelineAddEntries') {
-            instruction.entries.forEach(entry => {
-                if (entry.content && entry.content.entryType === 'TimelineTimelineItem' && entry.content.itemContent && entry.content.itemContent.itemType === 'TimelineUser') {
-                    if (entry.content.itemContent.user_results && entry.content.itemContent.user_results.result && typeof entry.content.itemContent.user_results.result.rest_id !== "undefined") {
-                        const restId = entry.content.itemContent.user_results.result.rest_id;
-                        acc[restId] = true;
-                    }
-                }
-            });
-        }
-        return acc;
-    }, {});
+// Likers --------------------------------------------------------------------
+async function fetch_likers(tweetId, max = 1000) {
+  return fetch_timeline_users('favoriters', tweetId, max);
+}
 
-        const likers = Object.keys(users);
-        return likers;
-  }
+// Retweeters (no-comment) ----------------------------------------------------
+async function fetch_no_comment_reposters(tweetId, max = 1000) {
+  return fetch_timeline_users('retweeters', tweetId, max);
+}
 
-  async function fetch_no_comment_reposters (tweetId) {
-    const retweetersId = await wait_for_query_id('retweeters')
-    const response = await safeCall('retweeters', `https://x.com/i/api/graphql/${retweetersId}/Retweeters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${paramsREQ}`)
-        const data = response.data;
+// Shared walker for likers/retweeters ---------------------------------------
+async function fetch_timeline_users(opKey, tweetId, max) {
+  const users = [];
+  let cursor = null;
 
-        const users = data["data"]["retweeters_timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
-        if (instruction.type === 'TimelineAddEntries') {
-            instruction.entries.forEach(entry => {
-                if (entry.content && entry.content.entryType === 'TimelineTimelineItem' && entry.content.itemContent && entry.content.itemContent.itemType === 'TimelineUser') {
-                    if (entry.content.itemContent.user_results && entry.content.itemContent.user_results.result && typeof entry.content.itemContent.user_results.result.rest_id !== "undefined") {
-                        const restId = entry.content.itemContent.user_results.result.rest_id;
-                        acc[restId] = true;
-                    }
-                }
-            });
-        }
-            return acc;
-        }, {});
+  do {
+    const batchSize = Math.min(200, max - users.length);
+    const url = buildGqlUrl(opKey, {
+      tweetId,
+      count: batchSize,
+      cursor,
+      includePromotedContent: true,
+    });
 
-      const reposters = Object.keys(users);
-      return reposters;
-  }
+    const resp = await safeCall(opKey, url);
+    const instructions =
+      resp.data[`data`][`${opKey}_timeline`].timeline.instructions;
 
+    cursor = null;
+    instructions.forEach((ins) => {
+      if (ins.type === 'TimelineAddEntries') {
+        ins.entries.forEach((e) => {
+          if (
+            e.content?.entryType === 'TimelineTimelineItem' &&
+            e.content.itemContent?.itemType === 'TimelineUser'
+          ) {
+            const id =
+              e.content.itemContent.user_results?.result?.rest_id;
+            if (id) users.push(id);
+          }
+          if (
+            e.content?.entryType === 'TimelineTimelineCursor' &&
+            e.content.cursorType === 'Bottom'
+          ) {
+            cursor = e.content.value;
+          }
+        });
+      }
+    });
+  } while (cursor && users.length < max);
 
+  return users.slice(0, max);
+}
 
-  async function fetch_list_members (listId) {
+   async function fetch_list_members (listId) {
     const users = (await safeCall('list_members', `/1.1/lists/members.json?list_id=${listId}`)).data.users
     const members = users.map(u => u.id_str)
     return members
