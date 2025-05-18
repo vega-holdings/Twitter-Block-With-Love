@@ -129,6 +129,35 @@
 
   const queryIds = {}
 
+  function p_limit (concurrency) {
+    const queue = []
+    let activeCount = 0
+
+    const next = () => {
+      if (activeCount >= concurrency || queue.length === 0) return
+      const { fn, resolve, reject } = queue.shift()
+      activeCount++
+      Promise.resolve()
+        .then(fn)
+        .then(value => {
+          activeCount--
+          resolve(value)
+          next()
+        }, err => {
+          activeCount--
+          reject(err)
+          next()
+        })
+    }
+
+    return (fn) => new Promise((resolve, reject) => {
+      queue.push({ fn, resolve, reject })
+      next()
+    })
+  }
+
+  const requestLimit = p_limit(2)
+
   ;(function hookFetch () {
     const origFetch = window.fetch
     window.fetch = function (...args) {
@@ -482,7 +511,7 @@
   }
 
   function block_user (id) {
-    ajax.post('/1.1/blocks/create.json', Qs.stringify({
+    return ajax.post('/1.1/blocks/create.json', Qs.stringify({
       user_id: id
     }), {
       headers: {
@@ -492,7 +521,7 @@
   }
 
   function mute_user (id) {
-    ajax.post('/1.1/mutes/users/create.json', Qs.stringify({
+    return ajax.post('/1.1/mutes/users/create.json', Qs.stringify({
       user_id: id
     }), {
       headers: {
@@ -528,7 +557,7 @@
         likers.push(tweeter)
       }
     }
-    likers.forEach(block_user)
+    await Promise.all(likers.map(id => requestLimit(() => block_user(id))))
   }
 
   async function mute_all_likers () {
@@ -540,14 +569,13 @@
         likers.push(tweeter)
       }
     }
-    likers.forEach(mute_user)
+    await Promise.all(likers.map(id => requestLimit(() => mute_user(id))))
   }
 
   async function block_followers () {
     const userName = window.location.href.match(/http.*\/(\w+)\/followers/)[1]
     const followers = await fetch_followers(userName, 10000)
-
-    followers.forEach(block_user)
+    await Promise.all(followers.map(id => requestLimit(() => block_user(id))))
   }
 
   async function block_reposters () {
@@ -559,7 +587,7 @@
         reposters.push(tweeter)
       }
     }
-    reposters.forEach(block_user)
+    await Promise.all(reposters.map(id => requestLimit(() => block_user(id))))
   }
 
   async function mute_reposters () {
@@ -571,19 +599,19 @@
         reposters.push(tweeter)
       }
     }
-    reposters.forEach(mute_user)
+    await Promise.all(reposters.map(id => requestLimit(() => mute_user(id))))
   }
 
   async function block_list_members () {
     const listId = get_list_id()
     const members = await fetch_list_members(listId)
-    members.forEach(block_user)
+    await Promise.all(members.map(id => requestLimit(() => block_user(id))))
   }
 
   async function mute_list_members () {
     const listId = get_list_id()
     const members = await fetch_list_members(listId)
-    members.forEach(mute_user)
+    await Promise.all(members.map(id => requestLimit(() => mute_user(id))))
   }
 
   async function mute () {
