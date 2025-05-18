@@ -423,7 +423,52 @@
   const paramsREQ = `features=%7B%22responsive_web_graphql_exclude_directive_enabled%22%3Atrue%2C%22verified_phone_label_enabled%22%3Afalse%2C%22creator_subscriptions_tweet_preview_api_enabled%22%3Atrue%2C%22responsive_web_graphql_timeline_navigation_enabled%22%3Atrue%2C%22responsive_web_graphql_skip_user_profile_image_extensions_enabled%22%3Afalse%2C%22c9s_tweet_anatomy_moderator_badge_enabled%22%3Atrue%2C%22tweetypie_unmention_optimization_enabled%22%3Atrue%2C%22responsive_web_edit_tweet_api_enabled%22%3Atrue%2C%22graphql_is_translatable_rweb_tweet_is_translatable_enabled%22%3Atrue%2C%22view_counts_everywhere_api_enabled%22%3Atrue%2C%22longform_notetweets_consumption_enabled%22%3Atrue%2C%22responsive_web_twitter_article_tweet_consumption_enabled%22%3Atrue%2C%22tweet_awards_web_tipping_enabled%22%3Afalse%2C%22freedom_of_speech_not_reach_fetch_enabled%22%3Atrue%2C%22standardized_nudges_misinfo%22%3Atrue%2C%22tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled%22%3Atrue%2C%22rweb_video_timestamps_enabled%22%3Atrue%2C%22longform_notetweets_rich_text_read_enabled%22%3Atrue%2C%22longform_notetweets_inline_media_enabled%22%3Atrue%2C%22responsive_web_enhance_cards_enabled%22%3Afalse%7D`
 
   // fetch current followers
+  async function fetch_followers (userName, count) {
+    const userByScreenNameId = await wait_for_query_id('userByScreenName')
+    const paramsUserExtReq = 'features=%7B%22hidden_profile_subscriptions_enabled%22%3Atrue%2C%22profile_label_improvements_pcf_label_in_post_enabled%22%3Atrue%2C%22rweb_tipjar_consumption_enabled%22%3Atrue%7D'
+    const userIdResponse = await ajax.get(`https://x.com/i/api/graphql/${userByScreenNameId}/UserByScreenName?variables=%7B%22screen_name%22%3A%22${userName}%22%7D&${paramsUserExtReq}`)
+    const userId = userIdResponse.data["data"]["user"]["result"]["rest_id"]
 
+    const followersId = await wait_for_query_id('followers')
+    const followers = []
+    let cursor = null
+    while (followers.length < count) {
+      const variablesObj = {
+        userId,
+        count: Math.min(200, count - followers.length),
+        cursor,
+        includePromotedContent: false
+      }
+      const variables = encodeURIComponent(JSON.stringify(variablesObj))
+      const response = await ajax.get(`https://x.com/i/api/graphql/${followersId}/Followers?variables=${variables}&${paramsREQ}`)
+      const instructions = response.data["data"]["user"]["result"]["timeline"]["timeline"]["instructions"]
+      cursor = null
+      instructions.forEach(instruction => {
+        if (instruction.type === 'TimelineAddEntries') {
+          instruction.entries.forEach(entry => {
+            if (
+              entry.content &&
+              entry.content.entryType === 'TimelineTimelineItem' &&
+              entry.content.itemContent &&
+              entry.content.itemContent.itemType === 'TimelineUser'
+            ) {
+              const restId = entry.content.itemContent.user_results &&
+                entry.content.itemContent.user_results.result &&
+                entry.content.itemContent.user_results.result.rest_id
+              if (restId) followers.push(restId)
+            } else if (
+              entry.content &&
+              entry.content.entryType === 'TimelineTimelineCursor' &&
+              entry.content.cursorType === 'Bottom'
+            ) {
+              cursor = entry.content.value
+            }
+          })
+        }
+      })
+      if (!cursor) break
+    }
+    return followers.slice(0, count)
   }
 
   // fetch_likers and fetch_no_comment_reposters need to be merged into one function
