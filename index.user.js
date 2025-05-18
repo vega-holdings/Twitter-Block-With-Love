@@ -181,13 +181,24 @@ function captureQueryId (url) {
   }
 })();
 
-(function hookXHR () {
-  const origOpen = XMLHttpRequest.prototype.open
+/* ---------- capture persisted-query IDs from all XHR traffic ---------- */
+(function hookXhr () {
+  const OrigOpen = XMLHttpRequest.prototype.open;
+  const OrigSend = XMLHttpRequest.prototype.send;
+
+  // remember the URL on .open()
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    if (typeof url === 'string') captureQueryId(url)
-    return origOpen.call(this, method, url, ...rest)
-  }
+    this._tbwl_url = url;
+    return OrigOpen.call(this, method, url, ...rest);
+  };
+
+  // inspect it on .send()
+  XMLHttpRequest.prototype.send = function (...args) {
+    if (this._tbwl_url) captureQueryId(this._tbwl_url);   // captureQueryId() already exists
+    return OrigSend.apply(this, args);
+  };
 })();
+
 
 
   async function scrape_query_id_from_scripts (key) {
@@ -240,21 +251,39 @@ function captureQueryId (url) {
     })
   }
 
-  async function safeCall (opName, url) {
-    try {
-      return await ajax.get(url)
-    } catch (e) {
-      if (e.response && e.response.status === 404 && queryIds[opName]) {
-        delete queryIds[opName]
-        try {
-          const { id: newId } = await wait_for_query_id(opName)
-          const newUrl = url.replace(/\/i\/api\/graphql\/[^/]+/, `/i/api/graphql/${newId}`)
-          return await ajax.get(newUrl)
-        } catch {}
-      }
-      throw e
+/* ---------- resilient wrapper for axios.get ---------- */
+async function safeCall (opKey, url) {
+  try {
+    return await ajax.get(url);
+  } catch (e) {
+    // 404 ⇒ hash / features mismatch → refresh the meta and retry once
+    if (e.response?.status === 404 && queryIds[opKey]) {
+      delete queryIds[opKey];
+      try {
+        const { id, feat } = await wait_for_query_id(opKey);      // { id, feat }
+        const varsMatch = /variables=([^&]+)/.exec(url);           // preserve original variables
+        const varsPart  = varsMatch ? `variables=${varsMatch[1]}` : '';
+
+        const opNameMap = {
+          followers:        'Followers',
+          userByScreenName: 'UserByScreenName',
+          favoriters:       'Favoriters',
+          retweeters:       'Retweeters'
+        };
+        const opName = opNameMap[opKey] || opKey;
+
+        let newUrl = `/i/api/graphql/${id}/${opName}`;
+        if (varsPart) newUrl += `?${varsPart}`;
+        if (feat)     newUrl += `${varsPart ? '&' : '?'}${feat}`;
+
+        return await ajax.get(newUrl);
+      } catch {/* refresh failed — fall through and re-throw */}
     }
+    throw e;
   }
+}
+
+
 
   let lang = document.documentElement.lang
   if (lang == 'en-US') {
