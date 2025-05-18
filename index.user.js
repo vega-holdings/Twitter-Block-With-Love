@@ -158,23 +158,42 @@ function p_limit(concurrency) {
 }
 const requestLimit = p_limit(2);      // two parallel X calls max
 
+function captureQueryId (url) {
+  let m
+  if ((m = /\/i\/api\/graphql\/([^/]+)\/Followers/.exec(url))) {
+    queryIds.followers = { id: m[1], feat: extractFeat(url) }
+  } else if ((m = /\/i\/api\/graphql\/([^/]+)\/UserByScreenName/.exec(url))) {
+    queryIds.userByScreenName = { id: m[1], feat: extractFeat(url) }
+  } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Favoriters/.exec(url))) {
+    queryIds.favoriters = { id: m[1], feat: extractFeat(url) }
+  } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Retweeters/.exec(url))) {
+    queryIds.retweeters = { id: m[1], feat: extractFeat(url) }
+  }
+}
+
 (function hookFetch () {
-  const origFetch = window.fetch;
+  const origFetch = window.fetch
   window.fetch = function (...args) {
-    const req = args[0];
-    const url = req instanceof Request ? req.url : req;
-    let m;
-    if ((m = /\/i\/api\/graphql\/([^/]+)\/Followers/.exec(url))) {
-      queryIds.followers        = { id: m[1], feat: extractFeat(url) };
-    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/UserByScreenName/.exec(url))) {
-      queryIds.userByScreenName = { id: m[1], feat: extractFeat(url) };
-    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Favoriters/.exec(url))) {
-      queryIds.favoriters       = { id: m[1], feat: extractFeat(url) };
-    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Retweeters/.exec(url))) {
-      queryIds.retweeters       = { id: m[1], feat: extractFeat(url) };
-    }
-    return origFetch.apply(this, args);
-  };
+    const req = args[0]
+    const url = req instanceof Request ? req.url : req
+    captureQueryId(url)
+    return origFetch.apply(this, args)
+  }
+})();
+
+(function hookXhr () {
+  const origOpen = XMLHttpRequest.prototype.open
+  const origSend = XMLHttpRequest.prototype.send
+
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this._tbwl_url = url
+    return origOpen.call(this, method, url, ...rest)
+  }
+
+  XMLHttpRequest.prototype.send = function (...args) {
+    if (this._tbwl_url) captureQueryId(this._tbwl_url)
+    return origSend.apply(this, args)
+  }
 })();
 
 
