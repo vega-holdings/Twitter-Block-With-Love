@@ -223,6 +223,22 @@
     })
   }
 
+  async function safeCall (opName, url) {
+    try {
+      return await ajax.get(url)
+    } catch (e) {
+      if (e.response && e.response.status === 404 && queryIds[opName]) {
+        delete queryIds[opName]
+        try {
+          const newId = await wait_for_query_id(opName)
+          const newUrl = url.replace(/\/i\/api\/graphql\/[^/]+/, `/i/api/graphql/${newId}`)
+          return await ajax.get(newUrl)
+        } catch {}
+      }
+      throw e
+    }
+  }
+
   let lang = document.documentElement.lang
   if (lang == 'en-US') {
     lang = 'en' // TweetDeck
@@ -506,7 +522,7 @@
   // fetch_likers and fetch_no_comment_reposters need to be merged into one function
   async function fetch_likers (tweetId) {
     const favoritersId = await wait_for_query_id('favoriters')
-    const response = await ajax.get(`https://x.com/i/api/graphql/${favoritersId}/Favoriters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${paramsREQ}`);
+    const response = await safeCall('favoriters', `https://x.com/i/api/graphql/${favoritersId}/Favoriters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${paramsREQ}`)
         const data = response.data;
 
         const users = data["data"]["favoriters_timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
@@ -529,7 +545,7 @@
 
   async function fetch_no_comment_reposters (tweetId) {
     const retweetersId = await wait_for_query_id('retweeters')
-    const response = await ajax.get(`https://x.com/i/api/graphql/${retweetersId}/Retweeters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${paramsREQ}`);
+    const response = await safeCall('retweeters', `https://x.com/i/api/graphql/${retweetersId}/Retweeters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${paramsREQ}`)
         const data = response.data;
 
         const users = data["data"]["retweeters_timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
@@ -553,7 +569,7 @@
 
 
   async function fetch_list_members (listId) {
-    const users = (await ajax.get(`/1.1/lists/members.json?list_id=${listId}`)).data.users
+    const users = (await safeCall('list_members', `/1.1/lists/members.json?list_id=${listId}`)).data.users
     const members = users.map(u => u.id_str)
     return members
   }
@@ -580,7 +596,7 @@
 
   async function get_tweeter (tweetId) {
     const screen_name = location.href.split('x.com/')[1].split('/')[0]
-    const tweetData = (await ajax.get(`/2/timeline/conversation/${tweetId}.json`)).data
+    const tweetData = (await safeCall('conversation', `/2/timeline/conversation/${tweetId}.json`)).data
     // Find the tweeter by username
     const users = tweetData.globalObjects.users
     for (const key in users) {
