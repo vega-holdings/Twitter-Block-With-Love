@@ -148,12 +148,47 @@
     }
   })()
 
-  function wait_for_query_id (key, timeout = 5000) {
+  async function scrape_query_id_from_main (key) {
+    try {
+      const opNameMap = {
+        followers: 'Followers',
+        userByScreenName: 'UserByScreenName',
+        favoriters: 'Favoriters',
+        retweeters: 'Retweeters'
+      }
+      const opName = opNameMap[key]
+      if (!opName) return undefined
+
+      const script = Array.from(document.querySelectorAll('script[src]'))
+        .map(s => s.src)
+        .find(src => /main\.[^/]+\.js$/.test(src))
+      if (!script) return undefined
+
+      const text = await (await fetch(script)).text()
+      const regex = new RegExp(`"operationName":"${opName}"[\\s\\S]*?"queryId":"([^"\\s]+)"`)
+      const m = regex.exec(text)
+      if (m) {
+        queryIds[key] = m[1]
+        return m[1]
+      }
+    } catch (e) {
+      console.error('[TBWL] Failed to scrape query ID', e)
+    }
+    return undefined
+  }
+
+  function wait_for_query_id (key, timeout = 30000) {
     return new Promise((resolve, reject) => {
       const start = Date.now()
       ;(function check () {
         if (queryIds[key]) return resolve(queryIds[key])
-        if (Date.now() - start >= timeout) return reject(new Error(`Query ID for ${key} not found`))
+        if (Date.now() - start >= timeout) {
+          scrape_query_id_from_main(key).then(id => {
+            if (id) resolve(id)
+            else reject(new Error(`Query ID for ${key} not found`))
+          })
+          return
+        }
         setTimeout(check, 100)
       })()
     })
