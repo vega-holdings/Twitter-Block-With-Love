@@ -129,47 +129,115 @@
 
   const queryIds = {}
 
-  function extractFeat (url) {
-    try {
-      const query = url.split('?')[1]
-      const params = new URLSearchParams(query)
-      const parts = []
-      if (params.has('features')) parts.push('features=' + params.get('features'))
-      if (params.has('fieldToggles')) parts.push('fieldToggles=' + params.get('fieldToggles'))
-      return parts.join('&')
-    } catch (e) {
-      return ''
+/* ---------- feature extractor ---------- */
+function extractFeat(url) {
+  try {
+    const qs = url.split('?')[1] || '';
+    const params = new URLSearchParams(qs);
+    const out = [];
+    if (params.has('features'))      out.push('features='      + params.get('features'));
+    if (params.has('fieldToggles'))  out.push('fieldToggles='  + params.get('fieldToggles'));
+    return out.join('&');
+  } catch { return ''; }
+}
+
+/* ---------- tiny promise-pool (rate-limit) ---------- */
+function p_limit(concurrency) {
+  const queue = [];
+  let active = 0;
+  const next = () => {
+    if (active >= concurrency || !queue.length) return;
+    const { fn, res, rej } = queue.shift();
+    active++;
+    Promise.resolve()
+      .then(fn)
+      .then(v => { active--; res(v); next(); },
+            e => { active--; rej(e); next(); });
+  };
+  return fn => new Promise((res, rej) => { queue.push({ fn, res, rej }); next(); });
+}
+const requestLimit = p_limit(2);      // two parallel X calls max
+
+(function hookFetch () {
+  const origFetch = window.fetch;
+  window.fetch = function (...args) {
+    const req = args[0];
+    const url = req instanceof Request ? req.url : req;
+    let m;
+    if ((m = /\/i\/api\/graphql\/([^/]+)\/Followers/.exec(url))) {
+      queryIds.followers        = { id: m[1], feat: extractFeat(url) };
+    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/UserByScreenName/.exec(url))) {
+      queryIds.userByScreenName = { id: m[1], feat: extractFeat(url) };
+    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Favoriters/.exec(url))) {
+      queryIds.favoriters       = { id: m[1], feat: extractFeat(url) };
+    } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Retweeters/.exec(url))) {
+      queryIds.retweeters       = { id: m[1], feat: extractFeat(url) };
     }
+    return origFetch.apply(this, args);
+  };
+})();
+
+
+  async function scrape_query_id_from_main (key) {
+    try {
+      const opNameMap = {
+        followers: 'Followers',
+        userByScreenName: 'UserByScreenName',
+        favoriters: 'Favoriters',
+        retweeters: 'Retweeters'
+      }
+      const opName = opNameMap[key]
+      if (!opName) return undefined
+
+      const script = Array.from(document.querySelectorAll('script[src]'))
+        .map(s => s.src)
+        .find(src => /main\.[^/]+\.js$/.test(src))
+      if (!script) return undefined
+
+      const text = await (await fetch(script)).text()
+      const regex = new RegExp(`"operationName":"${opName}"[\\s\\S]*?"queryId":"([^"\\s]+)"`)
+      const m = regex.exec(text)
+      if (m) {
+        queryIds[key] = m[1]
+        return m[1]
+      }
+    } catch (e) {
+      console.error('[TBWL] Failed to scrape query ID', e)
+    }
+    return undefined
   }
 
-  ;(function hookFetch () {
-    const origFetch = window.fetch
-    window.fetch = function (...args) {
-      const request = args[0]
-      const url = request instanceof Request ? request.url : request
-      let m
-      if ((m = /\/i\/api\/graphql\/([^/]+)\/Followers/.exec(url))) {
-        queryIds.followers = { id: m[1], feat: extractFeat(url) }
-      } else if ((m = /\/i\/api\/graphql\/([^/]+)\/UserByScreenName/.exec(url))) {
-        queryIds.userByScreenName = { id: m[1], feat: extractFeat(url) }
-      } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Favoriters/.exec(url))) {
-        queryIds.favoriters = { id: m[1], feat: extractFeat(url) }
-      } else if ((m = /\/i\/api\/graphql\/([^/]+)\/Retweeters/.exec(url))) {
-        queryIds.retweeters = { id: m[1], feat: extractFeat(url) }
-      }
-      return origFetch.apply(this, args)
-    }
-  })()
-
-  function wait_for_query_id (key, timeout = 5000) {
+  function wait_for_query_id (key, timeout = 30000) {
     return new Promise((resolve, reject) => {
       const start = Date.now()
       ;(function check () {
         if (queryIds[key]) return resolve(queryIds[key])
-        if (Date.now() - start >= timeout) return reject(new Error(`Query ID for ${key} not found`))
+        if (Date.now() - start >= timeout) {
+          scrape_query_id_from_main(key).then(id => {
+            if (id) resolve(id)
+            else reject(new Error(`Query ID for ${key} not found`))
+          })
+          return
+        }
         setTimeout(check, 100)
       })()
     })
+  }
+
+  async function safeCall (opName, url) {
+    try {
+      return await ajax.get(url)
+    } catch (e) {
+      if (e.response && e.response.status === 404 && queryIds[opName]) {
+        delete queryIds[opName]
+        try {
+          const newId = await wait_for_query_id(opName)
+          const newUrl = url.replace(/\/i\/api\/graphql\/[^/]+/, `/i/api/graphql/${newId}`)
+          return await ajax.get(newUrl)
+        } catch {}
+      }
+      throw e
+    }
   }
 
   let lang = document.documentElement.lang
@@ -405,6 +473,19 @@
     return ''
   }
 
+  const PUBLIC_BEARER_TOKEN =
+    'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA'
+
+  function get_bearer_token () {
+    for (const script of document.querySelectorAll('script')) {
+      const m = script.textContent.match(/Bearer\s+([A-Za-z0-9%-]+)/)
+      if (m) {
+        return m[1]
+      }
+    }
+    return get_cookie('ct0') || PUBLIC_BEARER_TOKEN
+  }
+
   function get_ancestor (dom, level) {
     for (let i = 0; i < level; ++i) {
       dom = dom.parent()
@@ -416,7 +497,7 @@
     baseURL: 'https://api.x.com',
     withCredentials: true,
     headers: {
-      Authorization: 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
+      Authorization: `Bearer ${get_bearer_token()}`,
       'X-Twitter-Auth-Type': 'OAuth2Session',
       'X-Twitter-Active-User': 'yes',
       'X-Csrf-Token': get_cookie('ct0')
@@ -434,90 +515,122 @@
   }
 
   // fetch current followers
+// Followers -----------------------------------------------------------------
+async function fetch_followers(userName, max = 1000) {
+  // 1) resolve userId
+  const { id: uId } = await wait_for_query_id('userByScreenName');
+  const uResp = await safeCall(
+    'userByScreenName',
+    buildGqlUrl('userByScreenName', { screen_name: userName })
+  );
+  const userId = uResp.data.data.user.result.rest_id;
 
-  async function fetch_followers (userName, count) {
-    const { id: userIdQuery, feat: userFeat } = await wait_for_query_id('userByScreenName')
-    const userRes = await ajax.get(`https://x.com/i/api/graphql/${userIdQuery}/UserByScreenName?variables=%7B%22screen_name%22%3A%22${userName}%22%7D&${userFeat}`)
-    const userId = userRes.data["data"]["user"]["result"]["rest_id"]
+  // 2) walk the Followers timeline
+  const followers = [];
+  let cursor = null;
 
-    const { id, feat } = await wait_for_query_id('followers')
-    const response = await ajax.get(`https://x.com/i/api/graphql/${id}/Followers?variables=%7B%22userId%22%3A%22${userId}%22%2C%22count%22%3A${count}%2C%22includePromotedContent%22%3Afalse%7D&${feat}`)
-    const data = response.data
+  do {
+    const batchSize = Math.min(200, max - followers.length);
+    const url = buildGqlUrl('followers', {
+      userId,
+      count: batchSize,
+      cursor,
+      includePromotedContent: false,
+    });
 
-    const users = data["data"]["user"]["result"]["timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
-      if (instruction.type === 'TimelineAddEntries') {
-        instruction.entries.forEach(entry => {
-          if (entry.content && entry.content.entryType === 'TimelineTimelineItem' && entry.content.itemContent && entry.content.itemContent.itemType === 'TimelineUser') {
-            if (entry.content.itemContent.user_results && entry.content.itemContent.user_results.result && typeof entry.content.itemContent.user_results.result.rest_id !== 'undefined') {
-              const restId = entry.content.itemContent.user_results.result.rest_id
-              acc[restId] = true
-            }
+    const resp = await safeCall('followers', url);
+    const instructions =
+      resp.data.data.user.result.timeline.timeline.instructions;
+
+    // extract IDs + bottom cursor
+    cursor = null;
+    instructions.forEach((ins) => {
+      if (ins.type === 'TimelineAddEntries') {
+        ins.entries.forEach((e) => {
+          if (
+            e.content?.entryType === 'TimelineTimelineItem' &&
+            e.content.itemContent?.itemType === 'TimelineUser'
+          ) {
+            const id =
+              e.content.itemContent.user_results?.result?.rest_id;
+            if (id) followers.push(id);
           }
-        })
+          if (
+            e.content?.entryType === 'TimelineTimelineCursor' &&
+            e.content.cursorType === 'Bottom'
+          ) {
+            cursor = e.content.value;
+          }
+        });
       }
-      return acc
-    }, {})
+    });
+  } while (cursor && followers.length < max);
 
-    return Object.keys(users)
-  }
+  return followers.slice(0, max);
+}
 
-  // fetch_likers and fetch_no_comment_reposters need to be merged into one function
-  async function fetch_likers (tweetId) {
-    const { id, feat } = await wait_for_query_id('favoriters')
-    const response = await ajax.get(`https://x.com/i/api/graphql/${id}/Favoriters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${feat}`);
-        const data = response.data;
+// Likers --------------------------------------------------------------------
+async function fetch_likers(tweetId, max = 1000) {
+  return fetch_timeline_users('favoriters', tweetId, max);
+}
 
-        const users = data["data"]["favoriters_timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
-        if (instruction.type === 'TimelineAddEntries') {
-            instruction.entries.forEach(entry => {
-                if (entry.content && entry.content.entryType === 'TimelineTimelineItem' && entry.content.itemContent && entry.content.itemContent.itemType === 'TimelineUser') {
-                    if (entry.content.itemContent.user_results && entry.content.itemContent.user_results.result && typeof entry.content.itemContent.user_results.result.rest_id !== "undefined") {
-                        const restId = entry.content.itemContent.user_results.result.rest_id;
-                        acc[restId] = true;
-                    }
-                }
-            });
-        }
-        return acc;
-    }, {});
+// Retweeters (no-comment) ----------------------------------------------------
+async function fetch_no_comment_reposters(tweetId, max = 1000) {
+  return fetch_timeline_users('retweeters', tweetId, max);
+}
 
-        const likers = Object.keys(users);
-        return likers;
-  }
+// Shared walker for likers/retweeters ---------------------------------------
+async function fetch_timeline_users(opKey, tweetId, max) {
+  const users = [];
+  let cursor = null;
 
-  async function fetch_no_comment_reposters (tweetId) {
-    const { id, feat } = await wait_for_query_id('retweeters')
-    const response = await ajax.get(`https://x.com/i/api/graphql/${id}/Retweeters?variables=%7B%22tweetId%22%3A%22${tweetId}%22%2C%22includePromotedContent%22%3Atrue%7D&${feat}`);
-        const data = response.data;
+  do {
+    const batchSize = Math.min(200, max - users.length);
+    const url = buildGqlUrl(opKey, {
+      tweetId,
+      count: batchSize,
+      cursor,
+      includePromotedContent: true,
+    });
 
-        const users = data["data"]["retweeters_timeline"]["timeline"]["instructions"].reduce((acc, instruction) => {
-        if (instruction.type === 'TimelineAddEntries') {
-            instruction.entries.forEach(entry => {
-                if (entry.content && entry.content.entryType === 'TimelineTimelineItem' && entry.content.itemContent && entry.content.itemContent.itemType === 'TimelineUser') {
-                    if (entry.content.itemContent.user_results && entry.content.itemContent.user_results.result && typeof entry.content.itemContent.user_results.result.rest_id !== "undefined") {
-                        const restId = entry.content.itemContent.user_results.result.rest_id;
-                        acc[restId] = true;
-                    }
-                }
-            });
-        }
-            return acc;
-        }, {});
+    const resp = await safeCall(opKey, url);
+    const instructions =
+      resp.data[`data`][`${opKey}_timeline`].timeline.instructions;
 
-      const reposters = Object.keys(users);
-      return reposters;
-  }
+    cursor = null;
+    instructions.forEach((ins) => {
+      if (ins.type === 'TimelineAddEntries') {
+        ins.entries.forEach((e) => {
+          if (
+            e.content?.entryType === 'TimelineTimelineItem' &&
+            e.content.itemContent?.itemType === 'TimelineUser'
+          ) {
+            const id =
+              e.content.itemContent.user_results?.result?.rest_id;
+            if (id) users.push(id);
+          }
+          if (
+            e.content?.entryType === 'TimelineTimelineCursor' &&
+            e.content.cursorType === 'Bottom'
+          ) {
+            cursor = e.content.value;
+          }
+        });
+      }
+    });
+  } while (cursor && users.length < max);
 
+  return users.slice(0, max);
+}
 
-
-  async function fetch_list_members (listId) {
-    const users = (await ajax.get(`/1.1/lists/members.json?list_id=${listId}`)).data.users
+   async function fetch_list_members (listId) {
+    const users = (await safeCall('list_members', `/1.1/lists/members.json?list_id=${listId}`)).data.users
     const members = users.map(u => u.id_str)
     return members
   }
 
   function block_user (id) {
-    ajax.post('/1.1/blocks/create.json', Qs.stringify({
+    return ajax.post('/1.1/blocks/create.json', Qs.stringify({
       user_id: id
     }), {
       headers: {
@@ -527,7 +640,7 @@
   }
 
   function mute_user (id) {
-    ajax.post('/1.1/mutes/users/create.json', Qs.stringify({
+    return ajax.post('/1.1/mutes/users/create.json', Qs.stringify({
       user_id: id
     }), {
       headers: {
@@ -538,7 +651,7 @@
 
   async function get_tweeter (tweetId) {
     const screen_name = location.href.split('x.com/')[1].split('/')[0]
-    const tweetData = (await ajax.get(`/2/timeline/conversation/${tweetId}.json`)).data
+    const tweetData = (await safeCall('conversation', `/2/timeline/conversation/${tweetId}.json`)).data
     // Find the tweeter by username
     const users = tweetData.globalObjects.users
     for (const key in users) {
@@ -563,7 +676,7 @@
         likers.push(tweeter)
       }
     }
-    likers.forEach(block_user)
+    await Promise.all(likers.map(id => requestLimit(() => block_user(id))))
   }
 
   async function mute_all_likers () {
@@ -575,14 +688,13 @@
         likers.push(tweeter)
       }
     }
-    likers.forEach(mute_user)
+    await Promise.all(likers.map(id => requestLimit(() => mute_user(id))))
   }
 
   async function block_followers () {
     const userName = window.location.href.match(/http.*\/(\w+)\/followers/)[1]
     const followers = await fetch_followers(userName, 10000)
-
-    followers.forEach(block_user)
+    await Promise.all(followers.map(id => requestLimit(() => block_user(id))))
   }
 
   async function block_reposters () {
@@ -594,7 +706,7 @@
         reposters.push(tweeter)
       }
     }
-    reposters.forEach(block_user)
+    await Promise.all(reposters.map(id => requestLimit(() => block_user(id))))
   }
 
   async function mute_reposters () {
@@ -606,19 +718,19 @@
         reposters.push(tweeter)
       }
     }
-    reposters.forEach(mute_user)
+    await Promise.all(reposters.map(id => requestLimit(() => mute_user(id))))
   }
 
   async function block_list_members () {
     const listId = get_list_id()
     const members = await fetch_list_members(listId)
-    members.forEach(block_user)
+    await Promise.all(members.map(id => requestLimit(() => block_user(id))))
   }
 
   async function mute_list_members () {
     const listId = get_list_id()
     const members = await fetch_list_members(listId)
-    members.forEach(mute_user)
+    await Promise.all(members.map(id => requestLimit(() => mute_user(id))))
   }
 
   async function mute () {
@@ -889,34 +1001,59 @@
   }
 
   function main () {
-    const sleepTime = 700 // ms
-
     insert_css()
     const TBWLPanel = compose_panel()
 
-    let prevURL = undefined
-    setInterval(_ => {
-      const currentURL = window.location.href
-      if (prevURL !== currentURL) {
-        prevURL = currentURL
+    let prevURL
 
-        // Attention: /retweets may change to /reposts at any time.
-        // Good job, Elon.
-        // ♪ CEO, entrepreneur, born in 1971, Elon~~ Elon Reeve Musk~~ ♪♪
-        if (currentURL.endsWith('/likes') || currentURL.endsWith('/retweets') || currentURL.endsWith('/followers')) {
-          if ($('#tbwl-panel').length) {
-            TBWLPanel.slideDown('fast')
-          } else {
-            waitForKeyElements('div[data-testid="primaryColumn"] section, div[data-testid="primaryColumn"] div[data-testid="emptyState"]', ele => {
-              TBWLPanel.insertBefore(ele)
-              TBWLPanel.slideDown()
-            }, true)
-          }
+    function handleURLChange () {
+      const currentURL = window.location.href
+      if (prevURL === currentURL) return
+      prevURL = currentURL
+
+      // Attention: /retweets may change to /reposts at any time.
+      // Good job, Elon.
+      // ♪ CEO, entrepreneur, born in 1971, Elon~~ Elon Reeve Musk~~ ♪♪
+      if (currentURL.endsWith('/likes') || currentURL.endsWith('/retweets') || currentURL.endsWith('/followers')) {
+        if ($('#tbwl-panel').length) {
+          TBWLPanel.slideDown('fast')
         } else {
-          TBWLPanel.slideUp('fast')
+          waitForKeyElements('div[data-testid="primaryColumn"] section, div[data-testid="primaryColumn"] div[data-testid="emptyState"]', ele => {
+            TBWLPanel.insertBefore(ele)
+            TBWLPanel.slideDown()
+          }, true)
         }
+      } else {
+        TBWLPanel.slideUp('fast')
       }
-    }, sleepTime)
+    }
+
+    function hookNavigation () {
+      const origPushState = history.pushState
+      const origReplaceState = history.replaceState
+
+      history.pushState = function (...args) {
+        const ret = origPushState.apply(this, args)
+        handleURLChange()
+        return ret
+      }
+
+      history.replaceState = function (...args) {
+        const ret = origReplaceState.apply(this, args)
+        handleURLChange()
+        return ret
+      }
+
+      window.addEventListener('popstate', handleURLChange)
+
+      new MutationObserver(handleURLChange).observe(document.body, {
+        childList: true,
+        subtree: true
+      })
+    }
+
+    hookNavigation()
+    handleURLChange()
 
     // TODO: merge into the above way
     // need a way to hide the include_original_tweeter option
