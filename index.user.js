@@ -178,7 +178,7 @@ const requestLimit = p_limit(2);      // two parallel X calls max
 })();
 
 
-  async function scrape_query_id_from_main (key) {
+  async function scrape_query_id_from_scripts (key) {
     try {
       const opNameMap = {
         followers: 'Followers',
@@ -189,17 +189,17 @@ const requestLimit = p_limit(2);      // two parallel X calls max
       const opName = opNameMap[key]
       if (!opName) return undefined
 
-      const script = Array.from(document.querySelectorAll('script[src]'))
-        .map(s => s.src)
-        .find(src => /main\.[^/]+\.js$/.test(src))
-      if (!script) return undefined
-
-      const text = await (await fetch(script)).text()
-      const regex = new RegExp(`"operationName":"${opName}"[\\s\\S]*?"queryId":"([^"\\s]+)"`)
-      const m = regex.exec(text)
-      if (m) {
-        queryIds[key] = m[1]
-        return m[1]
+      const srcs = Array.from(document.querySelectorAll('script[src]')).map(s => s.src)
+      for (const src of srcs) {
+        try {
+          const text = await (await fetch(src)).text()
+          const regex = new RegExp(`"operationName":"${opName}"[\\s\\S]*?"queryId":"([^"\\s]+)"`)
+          const m = regex.exec(text)
+          if (m) {
+            queryIds[key] = m[1]
+            return m[1]
+          }
+        } catch {}
       }
     } catch (e) {
       console.error('[TBWL] Failed to scrape query ID', e)
@@ -213,7 +213,7 @@ const requestLimit = p_limit(2);      // two parallel X calls max
       ;(function check () {
         if (queryIds[key]) return resolve(queryIds[key])
         if (Date.now() - start >= timeout) {
-          scrape_query_id_from_main(key).then(id => {
+          scrape_query_id_from_scripts(key).then(id => {
             if (id) resolve(id)
             else reject(new Error(`Query ID for ${key} not found`))
           })
