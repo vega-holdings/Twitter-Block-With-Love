@@ -3,7 +3,7 @@
 // @namespace   https://www.eolstudy.com
 // @homepage    https://github.com/E011011101001/Twitter-Block-With-Love
 // @icon        https://raw.githubusercontent.com/E011011101001/Twitter-Block-With-Love/master/imgs/icon.svg
-// @version     2025.04.04
+// @version     2025.05.12
 // @description Block or mute all the Twitter users who like or repost a specific post(Tweet), with love.
 // @description:fr Bloque ou mute tous les utilisateurs de Twitter qui aiment ou repostent un post spécifique (Tweet), avec amour.
 // @description:zh-CN 屏蔽或隐藏所有转发或点赞某条推文的推特用户
@@ -710,6 +710,44 @@ async function fetch_timeline_users(opKey, tweetId, max) {
     })
   }
 
+  const auto_block_words = ['groyper', 'fella', '1488', 'noticer', 'troon']
+  const auto_blocked = new Set()
+
+  function should_auto_block (username, displayName) {
+    const u = (username || '').toLowerCase()
+    const d = (displayName || '').toLowerCase()
+    return auto_block_words.some(w => u.includes(w) || d.includes(w))
+  }
+
+  async function block_by_screen_name (name) {
+    try {
+      const resp = await safeCall(
+        'userByScreenName',
+        buildGqlUrl('userByScreenName', { screen_name: name })
+      )
+      const id = resp.data.data.user.result.rest_id
+      await requestLimit(() => block_user(id))
+    } catch (e) {
+      console.error('[TBWL] auto block failed', name, e)
+    }
+  }
+
+  function scan_auto_block () {
+    $('div[data-testid="UserCell"], div[data-testid="User-Name"]').each((_, el) => {
+      const $el = $(el)
+      if ($el.data('tbwlAuto')) return
+      $el.data('tbwlAuto', true)
+      const link = $el.find('a[href^="/"]')[0]
+      if (!link) return
+      const username = $(link).attr('href').split('/')[1]
+      const displayName = $el.text()
+      if (!auto_blocked.has(username) && should_auto_block(username, displayName)) {
+        auto_blocked.add(username)
+        block_by_screen_name(username)
+      }
+    })
+  }
+
   async function get_tweeter (tweetId) {
     const screen_name = location.href.split('x.com/')[1].split('/')[0]
     const tweetData = (await safeCall('conversation', `/2/timeline/conversation/${tweetId}.json`)).data
@@ -1115,6 +1153,12 @@ async function fetch_timeline_users(opKey, tweetId, max) {
 
     hookNavigation()
     handleURLChange()
+
+    new MutationObserver(scan_auto_block).observe(document.body, {
+      childList: true,
+      subtree: true
+    })
+    scan_auto_block()
 
     // TODO: merge into the above way
     // need a way to hide the include_original_tweeter option
